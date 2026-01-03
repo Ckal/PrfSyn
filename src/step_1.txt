@@ -1,0 +1,328 @@
+Gradio MCP Client + Server Setup
+Overview
+You'll create TWO separate Gradio applications:
+
+MCP Server (Gradio app with mcp_server=True) - exposes tools
+MCP Client (Gradio app using smolagents + MCPClient) - uses those tools
+
+Step 1: Create Your MCP Server
+File: mcp_server.py
+pythonimport gradio as gr
+
+def text_processor(text: str, operation: str) -> str:
+    """
+    Process text with various operations.
+    
+    Args:
+        text (str): Input text to process
+        operation (str): Operation type (uppercase, lowercase, reverse, word_count)
+    
+    Returns:
+        str: Processed text result
+    """
+    if operation == "uppercase":
+        return text.upper()
+    elif operation == "lowercase":
+        return text.lower()
+    elif operation == "reverse":
+        return text[::-1]
+    elif operation == "word_count":
+        return f"Word count: {len(text.split())}"
+    else:
+        return "Invalid operation"
+
+def calculator(expression: str) -> str:
+    """
+    Evaluate mathematical expressions safely.
+    
+    Args:
+        expression (str): Mathematical expression to evaluate
+    
+    Returns:
+        str: Result of the calculation
+    """
+    try:
+        # Simple and safe evaluation
+        allowed_chars = set('0123456789+-*/.() ')
+        if all(c in allowed_chars for c in expression):
+            result = eval(expression)
+            return f"Result: {result}"
+        else:
+            return "Error: Invalid characters in expression"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Create interfaces for each tool
+text_interface = gr.Interface(
+    fn=text_processor,
+    inputs=[
+        gr.Textbox(placeholder="Enter text to process..."),
+        gr.Dropdown(
+            choices=["uppercase", "lowercase", "reverse", "word_count"], 
+            value="uppercase",
+            label="Operation"
+        )
+    ],
+    outputs="textbox",
+    title="Text Processor"
+)
+
+calc_interface = gr.Interface(
+    fn=calculator,
+    inputs=gr.Textbox(placeholder="Enter math expression (e.g., 2+2*3)"),
+    outputs="textbox",
+    title="Calculator"
+)
+
+# Combine tools into tabbed interface
+demo = gr.TabbedInterface(
+    [text_interface, calc_interface],
+    ["Text Tools", "Calculator"],
+    title="My MCP Server Tools"
+)
+
+if __name__ == "__main__":
+    print("Starting MCP Server...")
+    print("Server will be available at: http://localhost:7860/gradio_api/mcp/sse")
+    demo.launch(mcp_server=True, share=False, server_port=7860)
+    
+Step 2: Install Required Dependencies
+bash: pip install "gradio[mcp]" smolagents
+
+Step 3: Create Your MCP Client
+
+File: mcp_client.py
+pythonimport gradio as gr
+from smolagents import InferenceClientModel, CodeAgent
+from smolagents.mcp_client import MCPClient
+import os
+
+# You'll need a Hugging Face token for the model
+# Get one from https://huggingface.co/settings/tokens
+HF_TOKEN = "your_hf_token_here"  # Replace with your token
+os.environ["HF_TOKEN"] = HF_TOKEN
+
+def create_agent():
+    """Create an agent that can use MCP tools."""
+    try:
+        # Connect to your MCP server
+        mcp_client = MCPClient({
+            "url": "http://localhost:7860/gradio_api/mcp/sse"
+        })
+        
+        # Get tools from the server
+        tools = mcp_client.get_tools()
+        print(f"Found {len(tools)} tools: {[tool.name for tool in tools]}")
+        
+        # Create an agent with these tools
+        model = InferenceClientModel()
+        agent = CodeAgent(tools=[*tools], model=model)
+        
+        return agent, mcp_client
+    except Exception as e:
+        print(f"Error connecting to MCP server: {e}")
+        return None, None
+
+def chat_with_agent(message, history, agent_state):
+    """Chat function that uses the agent with MCP tools."""
+    agent, mcp_client = agent_state
+    
+    if agent is None:
+        return "Error: Could not connect to MCP server. Make sure it's running on port 7860.", history, agent_state
+    
+    try:
+        # Use the agent to process the message
+        response = agent.run(message)
+        
+        # Update history
+        history.append([message, str(response)])
+        return "", history, agent_state
+        
+    except Exception as e:
+        error_msg = f"Error: {str(e)}"
+        history.append([message, error_msg])
+        return "", history, agent_state
+
+def setup_client():
+    """Initialize the MCP client interface."""
+    agent, mcp_client = create_agent()
+    
+    with gr.Blocks(title="MCP Client Interface") as demo:
+        gr.Markdown("# MCP Client - Chat with Tools")
+        gr.Markdown("This interface connects to your MCP server and uses its tools to answer questions.")
+        
+        if agent is None:
+            gr.Markdown("⚠️ **Could not connect to MCP server!**")
+            gr.Markdown("Make sure your MCP server is running: `python mcp_server.py`")
+        else:
+            gr.Markdown("✅ **Connected to MCP server successfully!**")
+            available_tools = [tool.name for tool in mcp_client.get_tools()]
+            gr.Markdown(f"**Available tools:** {', '.join(available_tools)}")
+        
+        chatbot = gr.Chatbot(
+            value=[],
+            height=400,
+            label="Chat History"
+        )
+        
+        msg = gr.Textbox(
+            placeholder="Ask me to process text or do calculations...",
+            label="Your Message"
+        )
+        
+        # Hidden state to store agent and mcp_client
+        agent_state = gr.State((agent, mcp_client))
+        
+        # Handle message submission
+        msg.submit(
+            chat_with_agent,
+            inputs=[msg, chatbot, agent_state],
+            outputs=[msg, chatbot, agent_state]
+        )
+        
+        # Example buttons
+        gr.Markdown("### Try these examples:")
+        
+        examples = [
+            "Convert 'hello world' to uppercase",
+            "Calculate 15 * 8 + 32",
+            "Reverse the text 'artificial intelligence'",
+            "Count words in 'this is a test sentence'",
+            "What is 100 / 4 - 10?"
+        ]
+        
+        for example in examples:
+            btn = gr.Button(example, size="sm")
+            btn.click(
+                lambda ex=example: ex,
+                outputs=msg
+            )
+        
+        # Cleanup function
+        def cleanup():
+            if mcp_client:
+                mcp_client.disconnect()
+        
+        demo.load(lambda: None)  # Dummy load function
+    
+    return demo
+
+if __name__ == "__main__":
+    print("Starting MCP Client...")
+    print("Make sure your MCP server is running first!")
+    demo = setup_client()
+    demo.launch(server_port=7861, share=False)
+Step 4: Usage Instructions
+1. Start the MCP Server
+bashpython mcp_server.py
+You should see:
+Starting MCP Server...
+Server will be available at: http://localhost:7860/gradio_api/mcp/sse
+Running on local URL:  http://127.0.0.1:7860
+2. Verify Server Tools
+Visit: http://localhost:7860/gradio_api/mcp/schema
+You should see JSON describing your available tools.
+3. Start the MCP Client (in another terminal)
+bashpython mcp_client.py
+4. Test the Connection
+
+Open http://localhost:7861 in your browser
+You should see "Connected to MCP server successfully!"
+Try the example prompts or ask things like:
+
+"Convert 'hello world' to uppercase"
+"Calculate 25 * 4"
+"Reverse the text 'gradio'"
+
+
+
+How It Works
+
+MCP Server (mcp_server.py):
+
+Gradio automatically converts your functions into MCP tools using docstrings and type hints
+Exposes tools at /gradio_api/mcp/sse endpoint
+
+
+MCP Client (mcp_client.py):
+
+Uses MCPClient to connect to the server URL
+Gets tools with mcp_client.get_tools()
+Creates a CodeAgent that can use these tools
+When you ask questions, the agent decides which tools to use
+
+
+
+Alternative: Simple Direct Tool Usage
+If you don't want the AI agent, you can directly call MCP tools:
+pythonimport gradio as gr
+from smolagents.mcp_client import MCPClient
+
+def direct_tool_interface():
+    # Connect to MCP server
+    mcp_client = MCPClient({
+        "url": "http://localhost:7860/gradio_api/mcp/sse"
+    })
+    
+    tools = mcp_client.get_tools()
+    tool_dict = {tool.name: tool for tool in tools}
+    
+    def use_tool(tool_name, text_input, operation_input):
+        if tool_name in tool_dict:
+            tool = tool_dict[tool_name]
+            try:
+                if tool_name == "text_processor":
+                    result = tool(text_input, operation_input)
+                elif tool_name == "calculator":
+                    result = tool(text_input)  # Use text_input as expression
+                else:
+                    result = tool(text_input)
+                return str(result)
+            except Exception as e:
+                return f"Error: {str(e)}"
+        return "Tool not found"
+    
+    interface = gr.Interface(
+        fn=use_tool,
+        inputs=[
+            gr.Dropdown(choices=list(tool_dict.keys()), label="Select Tool"),
+            gr.Textbox(label="Text Input"),
+            gr.Textbox(label="Operation (for text_processor)", value="uppercase")
+        ],
+        outputs="textbox",
+        title="Direct MCP Tool Usage"
+    )
+    
+    return interface
+
+# Usage:
+# demo = direct_tool_interface()
+# demo.launch(server_port=7862)
+Troubleshooting
+
+"Could not connect to MCP server"
+
+Ensure mcp_server.py is running on port 7860
+Check that the URL is correct: http://localhost:7860/gradio_api/mcp/sse
+
+
+"No tools found"
+
+Verify your server functions have proper docstrings and type hints
+Check the schema at http://localhost:7860/gradio_api/mcp/schema
+
+
+Import errors
+
+Install dependencies: pip install "gradio[mcp]" smolagents
+Get a HuggingFace token for the model
+
+
+Agent not using tools
+
+Make sure your prompts clearly indicate what you want to do
+The agent decides when to use tools based on the conversation context
+
+
+
+This setup gives you a complete Gradio-to-Gradio MCP system where you can create tools in one interface and use them through another!
